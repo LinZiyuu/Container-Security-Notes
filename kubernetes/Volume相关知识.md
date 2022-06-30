@@ -3,7 +3,7 @@
 
 ## PersistentVolume(PV)
 PV 为 Kubernete 集群提供了一个如何提供并且使用存储的抽象，与它一起被引入的另一个对象就是 PersistentVolumeClaim(PVC)，这两个对象之间的关系与节点和 Pod 之间的关系差不多：
-![](./PC%E4%B8%8EPVC.png)
+![](./PC%E4%B8%8EPVC.png)<br>
 PersistentVolume 是集群中的一种被管理员分配的存储资源<br>
 PersistentVolumeClaim 表示用户对存储资源的申请，它与 Pod 非常相似，PVC 消耗了持久卷资源，而 Pod 消耗了节点上的 CPU 和内存等物理资源<br>
 

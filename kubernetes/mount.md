@@ -1,7 +1,7 @@
 
 ## Volume manager
 ```go
-//in kubernetes/pkg/kubelet/volumemanager
+//in kubernetes/pkg/kubelet/volumemanager/volume_manager.go
 //常量的定义
 const (
     // reconcilerLoopSleepPeriod is the amount of time the reconciler loop waits
@@ -218,6 +218,9 @@ volumePluginMgr 和 csiMigratedPluginManager <br>
 desiredStateOfWorldPopulator <br>
 reconciler<br>
 ```go
+//in kubernetes\pkg\kubelet\kubelet.go
+
+
 // NewMainKubelet instantiates a new Kubelet object along with all the required internal modules.
 // No initialization of Kubelet and its modules should happen here.
 func NewMainKubelet(){
@@ -246,6 +249,8 @@ func NewMainKubelet(){
 }
 
 
+//in kubernetes/pkg/kubelet/volumanager/volume_manager.go
+
 // NewVolumeManager returns a new concrete instance implementing the
 // VolumeManager interface.
 
@@ -253,7 +258,20 @@ func NewMainKubelet(){
 //   to communicate with the API server to fetch PV and PVC objects
 // volumePluginMgr - the volume plugin manager used to access volume plugins.
 //   Must be pre-initialized.
-func NewVolumeManager(){
+func NewVolumeManager(
+	controllerAttachDetachEnabled bool,
+	nodeName k8stypes.NodeName,
+	podManager pod.Manager,
+	podStateProvider podStateProvider,
+	kubeClient clientset.Interface,
+	volumePluginMgr *volume.VolumePluginMgr,
+	kubeContainerRuntime container.Runtime,
+	mounter mount.Interface,
+	hostutil hostutil.HostUtils,
+	kubeletPodsDir string,
+	recorder record.EventRecorder,
+	keepTerminatedPodVolumes bool,
+	blockVolumePathHandler volumepathhandler.BlockVolumePathHandler) VolumeManager {
 
     vm := &volumeManager{
         kubeClient:          kubeClient,
@@ -304,7 +322,133 @@ func NewVolumeManager(){
     return vm
 }
 
+```
 
+desiredStateOfWorld和actualStateOfWorld源码:
+
+```go
+
+//in kubenetes/pkg/controller/volume/attachdetach/cache/desired_state_of_world.go
+
+//实例化
+// NewDesiredStateOfWorld returns a new instance of DesiredStateOfWorld.
+func NewDesiredStateOfWorld(volumePluginMgr *volume.VolumePluginMgr) DesiredStateOfWorld {
+	return &desiredStateOfWorld{
+		nodesManaged:    make(map[k8stypes.NodeName]nodeManaged),
+		volumePluginMgr: volumePluginMgr,
+	}
+}
+
+type desiredStateOfWorld struct {
+	// nodesManaged is a map containing the set of nodes managed by the attach/
+	// detach controller. The key in this map is the name of the node and the
+	// value is a node object containing more information about the node.
+
+
+    //key是nodeName value是相关信息
+
+	nodesManaged map[k8stypes.NodeName]nodeManaged
+	// volumePluginMgr is the volume plugin manager used to create volume
+	// plugin objects.
+
+	volumePluginMgr *volume.VolumePluginMgr
+	
+    //这个是什么作用？？
+    sync.RWMutex
+}
+
+//in kubenetes/pkg/controller/volume/attachdetach/cache/actual_state_of_world.go
+
+// NewActualStateOfWorld returns a new instance of ActualStateOfWorld.
+func NewActualStateOfWorld(volumePluginMgr *volume.VolumePluginMgr) ActualStateOfWorld {
+	return &actualStateOfWorld{
+		attachedVolumes:        make(map[v1.UniqueVolumeName]attachedVolume),
+		nodesToUpdateStatusFor: make(map[types.NodeName]nodeToUpdateStatusFor),
+		volumePluginMgr:        volumePluginMgr,
+	}
+}
+
+type actualStateOfWorld struct {
+	// attachedVolumes is a map containing the set of volumes the attach/detach
+	// controller believes to be successfully attached to the nodes it is
+	// managing. The key in this map is the name of the volume and the value is
+	// an object containing more information about the attached volume.
+
+
+    //存储的是已经成功attach到node上的volume
+	attachedVolumes map[v1.UniqueVolumeName]attachedVolume
+
+
+
+	// nodesToUpdateStatusFor is a map containing the set of nodes for which to
+	// update the VolumesAttached Status field. The key in this map is the name
+	// of the node and the value is an object containing more information about
+	// the node (including the list of volumes to report attached).
+
+    //存储更新status失败的node信息
+	nodesToUpdateStatusFor map[types.NodeName]nodeToUpdateStatusFor
+
+	// volumePluginMgr is the volume plugin manager used to create volume
+	// plugin objects.
+	volumePluginMgr *volume.VolumePluginMgr
+
+	sync.RWMutex
+}
+```
+
+NewOperationExecutor源码:
+```go
+
+// in kubernetes/pkg/kubelet/pluginmanager/operationexecutor/operation_executor.go
+
+// NewOperationExecutor returns a new instance of OperationExecutor.
+func NewOperationExecutor(
+	operationGenerator OperationGenerator) OperationExecutor {
+
+	return &operationExecutor{
+		pendingOperations:  goroutinemap.NewGoRoutineMap(true /* exponentialBackOffOnError */),
+		operationGenerator: operationGenerator,
+	}
+}
+
+```
+plugin manager源码:
+```go
+// in kubernetes/pkg/kubelet/pluginmanager/plugin_manager.go
+func NewPluginManager(
+	sockDir string,
+	recorder record.EventRecorder) PluginManager {
+	asw := cache.NewActualStateOfWorld()
+	dsw := cache.NewDesiredStateOfWorld()
+	reconciler := reconciler.NewReconciler(
+		operationexecutor.NewOperationExecutor(
+			operationexecutor.NewOperationGenerator(
+				recorder,
+			),
+		),
+		loopSleepDuration,
+		dsw,
+		asw,
+	)
+
+	pm := &pluginManager{
+		desiredStateOfWorldPopulator: pluginwatcher.NewWatcher(
+			sockDir,
+			dsw,
+		),
+		reconciler:          reconciler,
+		desiredStateOfWorld: dsw,
+		actualStateOfWorld:  asw,
+	}
+	return pm
+}
+```
+
+
+NewDesiredStateOfWorldPopulator源码:
+```go
+
+//in kubernetes/pkg/controller/volume/attachdetach/populator/desired_state_of_world_populator.go
 
 // NewDesiredStateOfWorldPopulator returns a new instance of
 // DesiredStateOfWorldPopulator.
@@ -448,38 +592,67 @@ kl.volumeManager.Run<br>
     findAndAddNewPods()<br>
     findAndRemoveDeletedPods() 每隔dswp.getPodStatusRetryDuration时长，进行findAndRemoveDeletedPods()<br>
 (2.3)启动 reconciler：预期状态和实际状态的协调者，负责调整实际状态至预期状态<br>
+
+kubelet、volumeManager  VolumePluginMgr desiredStateOfWorldPopulator Run 源码:
+
 ```go
+
+// in/kubernetes/pkg/kubelet/kubelet.go
+
 // Run starts the kubelet reacting to config updates
 func (kl *Kubelet) Run(updates <-chan kubetypes.PodUpdate) {
+	if kl.logServer == nil {
+		kl.logServer = http.StripPrefix("/logs/", http.FileServer(http.Dir("/var/log/")))
+	}
+	if kl.kubeClient == nil {
+		klog.InfoS("No API server defined - no node status update will be sent")
+	}
 
-    // Start volume manager
-    go kl.volumeManager.Run(kl.sourcesReady, wait.NeverStop)
+	// Start the cloud provider sync manager
+	if kl.cloudResourceSyncManager != nil {
+		go kl.cloudResourceSyncManager.Run(wait.NeverStop)
+	}
 
-    go wait.Until(kl.updateRuntimeUp, 5*time.Second, wait.NeverStop)
+	if err := kl.initializeModules(); err != nil {
+		kl.recorder.Eventf(kl.nodeRef, v1.EventTypeWarning, events.KubeletSetupFailed, err.Error())
+		klog.ErrorS(err, "Failed to initialize internal modules")
+		os.Exit(1)
+	}
 
-    // Set up iptables util rules
-    if kl.makeIPTablesUtilChains {
-        kl.initNetworkUtil()
-    }
+	// Start volume manager
+	go kl.volumeManager.Run(kl.sourcesReady, wait.NeverStop)
 
-    // Start a goroutine responsible for killing pods (that are not properly
-    // handled by pod workers).
-    go wait.Until(kl.podKiller.PerformPodKillingWork, 1*time.Second, wait.NeverStop)
+	if kl.kubeClient != nil {
+		// Introduce some small jittering to ensure that over time the requests won't start
+		// accumulating at approximately the same time from the set of nodes due to priority and
+		// fairness effect.
+		go wait.JitterUntil(kl.syncNodeStatus, kl.nodeStatusUpdateFrequency, 0.04, true, wait.NeverStop)
+		go kl.fastStatusUpdateOnce()
 
-    // Start component sync loops.
-    kl.statusManager.Start()
-    kl.probeManager.Start()
+		// start syncing lease
+		go kl.nodeLeaseController.Run(wait.NeverStop)
+	}
+	go wait.Until(kl.updateRuntimeUp, 5*time.Second, wait.NeverStop)
 
-    // Start syncing RuntimeClasses if enabled.
-    if kl.runtimeClassManager != nil {
-        kl.runtimeClassManager.Start(wait.NeverStop)
-    }
+	// Set up iptables util rules
+	if kl.makeIPTablesUtilChains {
+		kl.initNetworkUtil()
+	}
 
-    // Start the pod lifecycle event generator.
-    kl.pleg.Start()
-    kl.syncLoop(updates, kl)
+	// Start component sync loops.
+	kl.statusManager.Start()
+
+	// Start syncing RuntimeClasses if enabled.
+	if kl.runtimeClassManager != nil {
+		kl.runtimeClassManager.Start(wait.NeverStop)
+	}
+
+	// Start the pod lifecycle event generator.
+	kl.pleg.Start()
+	kl.syncLoop(updates, kl)
 }
 
+//in /kubernetes/pkg/kubelet/volumemanager/volume_manager.go
 
 func (vm *volumeManager) Run(sourcesReady config.SourcesReady, stopCh <-chan struct{}) {
     defer runtime.HandleCrash()
@@ -500,11 +673,39 @@ func (vm *volumeManager) Run(sourcesReady config.SourcesReady, stopCh <-chan str
     <-stopCh
     klog.Infof("Shutting down Kubelet Volume Manager")
 }
+
+//in /kubernetes/pkg/volume/plugins.go
+func (pm *VolumePluginMgr) Run(stopCh <-chan struct{}) {
+	kletHost, ok := pm.Host.(KubeletVolumeHost)
+	if ok {
+		// start informer for CSIDriver
+		informerFactory := kletHost.GetInformerFactory()
+		informerFactory.Start(stopCh)
+		informerFactory.WaitForCacheSync(stopCh)
+	}
+}
+
+//in /kubernetes/pkg/controller/volume/attachdetach/populator/desired_state_of_world_populator.go
+func (dswp *desiredStateOfWorldPopulator) Run(sourcesReady config.SourcesReady, stopCh <-chan struct{}) {
+	// Wait for the completion of a loop that started after sources are all ready, then set hasAddedPods accordingly
+	klog.InfoS("Desired state populator starts to run")
+	wait.PollUntil(dswp.loopSleepDuration, func() (bool, error) {
+        //
+		done := sourcesReady.AllReady()
+		dswp.populatorLoop()
+		return done, nil
+	}, stopCh)
+	dswp.hasAddedPodsLock.Lock()
+	dswp.hasAddedPods = true
+	dswp.hasAddedPodsLock.Unlock()
+	wait.Until(dswp.populatorLoop, dswp.loopSleepDuration, stopCh)
+}
 ```
 
 desiredStateOfWorldPopulator通过populatorLoop()来更新DesiredStateOfWorld
 
 ```go
+// in kubernetes/pkg/kubelet/volumemanager/populator/desired_state_of_world_populator.go
 func (dswp *desiredStateOfWorldPopulator) populatorLoop() {
     dswp.findAndAddNewPods()
 
@@ -566,6 +767,7 @@ func (dswp *desiredStateOfWorldPopulator) processPodVolumes(
         return
     }
 
+    //这什么意思呀？？
     uniquePodName := util.GetUniquePodName(pod)
     // 如果先前在processedPods map中，表示无需处理，提前返回
     if dswp.podPreviouslyProcessed(uniquePodName) {
@@ -770,6 +972,7 @@ func (rc *reconciler) Run(stopCh <-chan struct{}) {
 
 func (rc *reconciler) reconciliationLoopFunc() func() {
     return func() {
+        //这有什么用？？
         rc.reconcile()
 
         // Sync the state with the reality once after all existing pods are added to the desired state from all sources.
@@ -876,6 +1079,7 @@ func (rc *reconciler) mountAttachVolumes() {
                 remountingLogStr = "Volume is already mounted to pod, but remount was requested."
             }
             klog.V(4).Infof(volumeToMount.GenerateMsgDetailed("Starting operationExecutor.MountVolume", remountingLogStr))
+            //最重要的mount执行
             err := rc.operationExecutor.MountVolume(
                 rc.waitForAttachTimeout,
                 volumeToMount.VolumeToMount,
