@@ -725,36 +725,158 @@ func (dswp *desiredStateOfWorldPopulator) populatorLoop() {
 
     dswp.findAndRemoveDeletedPods()
 }
+```
 
+findAndAddNewPods源码:
+```go
 //遍历Pod manager中所有pod
 //过滤掉Terminated态的pod，进行processPodVolumes，把这些pod添加到desired state of world
 //就是通过podManager获取所有的pods，然后调用processPodVolumes去更新desiredStateOfWorld。但是这样只能更新新增加的Pods的Volume信息。
 
 // Iterate through all pods and add to desired state of world if they don't
 // exist but should
-func (dswp *desiredStateOfWorldPopulator) findAndAddNewPods() {
-    // Map unique pod name to outer volume name to MountedVolume.
-    mountedVolumesForPod := make(map[volumetypes.UniquePodName]map[string]cache.MountedVolume)
-    if utilfeature.DefaultFeatureGate.Enabled(features.ExpandInUsePersistentVolumes) {
-        for _, mountedVolume := range dswp.actualStateOfWorld.GetMountedVolumes() {
-            mountedVolumes, exist := mountedVolumesForPod[mountedVolume.PodName]
-            if !exist {
-                mountedVolumes = make(map[string]cache.MountedVolume)
-                mountedVolumesForPod[mountedVolume.PodName] = mountedVolumes
-            }
-            mountedVolumes[mountedVolume.OuterVolumeSpecName] = mountedVolume
-        }
-    }
 
-    processedVolumesForFSResize := sets.NewString()
-    for _, pod := range dswp.podManager.GetPods() {
-        if dswp.isPodTerminated(pod) {
-            // Do not (re)add volumes for terminated pods
-            continue
-        }
-        dswp.processPodVolumes(pod, mountedVolumesForPod, processedVolumesForFSResize)
-    }
+func (dswp *desiredStateOfWorldPopulator) findAndAddNewPods() {
+	// Map unique pod name to outer volume name to MountedVolume.
+	mountedVolumesForPod := make(map[volumetypes.UniquePodName]map[string]cache.MountedVolume)
+    //GetMountedVolumes返回一个要mountVolume的slice
+	for _, mountedVolume := range dswp.actualStateOfWorld.GetMountedVolumes() {
+        //返回Pod的UID
+		mountedVolumes, exist := mountedVolumesForPod[mountedVolume.PodName]
+		if !exist {
+			mountedVolumes = make(map[string]cache.MountedVolume)
+			mountedVolumesForPod[mountedVolume.PodName] = mountedVolumes
+		}
+        //添加Pod名字
+		mountedVolumes[mountedVolume.OuterVolumeSpecName] = mountedVolume
+	}
+    //GetPods返回 []*v1.Pod
+	for _, pod := range dswp.podManager.GetPods() {
+		//过滤掉Terminated态的pod
+        if dswp.podStateProvider.ShouldPodContainersBeTerminating(pod.UID) {
+			// Do not (re)add volumes for pods that can't also be starting containers
+			continue
+		}
+		dswp.processPodVolumes(pod, mountedVolumesForPod)
+	}
 }
+
+//in kubernetes/pkg/kubelet/volumemanager/cache/actual_state_of_world.go
+
+
+func (asw *actualStateOfWorld) GetMountedVolumes() []MountedVolume {
+    //加锁？？
+	asw.RLock()
+	defer asw.RUnlock()
+	mountedVolume := make([]MountedVolume, 0 /* len */, len(asw.attachedVolumes) /* cap */)
+    //遍历attach的volume
+    //attachedVolumes map[v1.UniqueVolumeName]attachedVolume
+    //attachedVolume是一个volume对象
+    //volumeObj是attachedVolume结构体
+    //attachedVolume.mountedPods
+    //mountedPods map[volumetypes.UniquePodName]mountedPod
+    //podObj是mounedPod结构体
+	for _, volumeObj := range asw.attachedVolumes {
+		for _, podObj := range volumeObj.mountedPods {
+            //operationexecutor.VolumeMounted代表Volume被成功mounted,可以更改asw
+			if podObj.volumeMountStateForPod == operationexecutor.VolumeMounted {
+				mountedVolume = append(
+					mountedVolume,
+					getMountedVolume(&podObj, &volumeObj))
+			}
+		}
+	}
+	return mountedVolume
+}
+
+
+type actualStateOfWorld struct {
+	// nodeName is the name of this node. This value is passed to Attach/Detach
+	nodeName types.NodeName
+
+	// attachedVolumes is a map containing the set of volumes the kubelet volume
+	// manager believes to be successfully attached to this node. Volume types
+	// that do not implement an attacher interface are assumed to be in this
+	// state by default.
+	// The key in this map is the name of the volume and the value is an object
+	// containing more information about the attached volume.
+	attachedVolumes map[v1.UniqueVolumeName]attachedVolume
+
+	// volumePluginMgr is the volume plugin manager used to create volume
+	// plugin objects.
+	volumePluginMgr *volume.VolumePluginMgr
+	sync.RWMutex
+}
+
+
+type mountedPod struct {
+	// the name of the pod
+	podName volumetypes.UniquePodName
+
+	// the UID of the pod
+	podUID types.UID
+
+	// mounter used to mount
+	mounter volume.Mounter
+
+	// mapper used to block volumes support
+	blockVolumeMapper volume.BlockVolumeMapper
+
+	// spec is the volume spec containing the specification for this volume.
+	// Used to generate the volume plugin object, and passed to plugin methods.
+	// In particular, the Unmount method uses spec.Name() as the volumeSpecName
+	// in the mount path:
+	// /var/lib/kubelet/pods/{podUID}/volumes/{escapeQualifiedPluginName}/{volumeSpecName}/
+	volumeSpec *volume.Spec
+
+	// outerVolumeSpecName is the volume.Spec.Name() of the volume as referenced
+	// directly in the pod. If the volume was referenced through a persistent
+	// volume claim, this contains the volume.Spec.Name() of the persistent
+	// volume claim
+	outerVolumeSpecName string
+
+	// remountRequired indicates the underlying volume has been successfully
+	// mounted to this pod but it should be remounted to reflect changes in the
+	// referencing pod.
+	// Atomically updating volumes depend on this to update the contents of the
+	// volume. All volume mounting calls should be idempotent so a second mount
+	// call for volumes that do not need to update contents should not fail.
+	remountRequired bool
+
+	// volumeGidValue contains the value of the GID annotation, if present.
+	volumeGidValue string
+
+	// volumeMountStateForPod stores state of volume mount for the pod. if it is:
+	//   - VolumeMounted: means volume for pod has been successfully mounted
+	//   - VolumeMountUncertain: means volume for pod may not be mounted, but it must be unmounted
+
+    //VolumeMountState是string
+	volumeMountStateForPod operationexecutor.VolumeMountState
+}
+
+// getMountedVolume constructs and returns a MountedVolume object from the given
+// mountedPod and attachedVolume objects.
+func getMountedVolume(
+	mountedPod *mountedPod, attachedVolume *attachedVolume) MountedVolume {
+	return MountedVolume{
+		MountedVolume: operationexecutor.MountedVolume{
+			PodName:             mountedPod.podName,
+			VolumeName:          attachedVolume.volumeName,
+			InnerVolumeSpecName: mountedPod.volumeSpec.Name(),
+			OuterVolumeSpecName: mountedPod.outerVolumeSpecName,
+			PluginName:          attachedVolume.pluginName,
+			PodUID:              mountedPod.podUID,
+			Mounter:             mountedPod.mounter,
+			BlockVolumeMapper:   mountedPod.blockVolumeMapper,
+			VolumeGidValue:      mountedPod.volumeGidValue,
+			VolumeSpec:          mountedPod.volumeSpec,
+			DeviceMountPath:     attachedVolume.deviceMountPath}}
+}
+
+
+
+
+
 
 //更新desiredStateOfWorld
 // processPodVolumes processes the volumes in the given pod and adds them to the
@@ -767,7 +889,7 @@ func (dswp *desiredStateOfWorldPopulator) processPodVolumes(
         return
     }
 
-    //这什么意思呀？？
+    //  获得Pod.UID
     uniquePodName := util.GetUniquePodName(pod)
     // 如果先前在processedPods map中，表示无需处理，提前返回
     if dswp.podPreviouslyProcessed(uniquePodName) {
@@ -955,10 +1077,12 @@ func (dswp *desiredStateOfWorldPopulator) findAndRemoveDeletedPods() {
 
 //desiredStateOfWorld就构建出来了，这是理想的volume状态，这里并没有发生实际的volume的创建删除挂载卸载操作。实际的操作由reconciler.Run(sourcesReady, stopCh)完成
 ```
+
+
 reconciler 调谐器，即按desiredStateOfWorld来同步volume配置操作
 
 主要流程
-通过定时任务定期同步，reconcile就是一致性函数，保存desired和actual状态一致。
+通过定时任务定期同步，reconcile就是一致性函数，保持desired和actual状态一致。
 
 reconcile首先从actualStateOfWorld获取已经挂载的volume信息，然后查看该volume是否存在于desiredStateOfWorld,假如不存在就卸载。
 
@@ -970,9 +1094,11 @@ func (rc *reconciler) Run(stopCh <-chan struct{}) {
     wait.Until(rc.reconciliationLoopFunc(), rc.loopSleepDuration, stopCh)
 }
 
+//返回一个函数
+
 func (rc *reconciler) reconciliationLoopFunc() func() {
     return func() {
-        //这有什么用？？
+
         rc.reconcile()
 
         // Sync the state with the reality once after all existing pods are added to the desired state from all sources.
@@ -1119,62 +1245,49 @@ func (rc *reconciler) mountAttachVolumes() {
     }
 }
 
-func (rc *reconciler) unmountDetachDevices() {
-    for _, attachedVolume := range rc.actualStateOfWorld.GetUnmountedVolumes() {
-        // Check IsOperationPending to avoid marking a volume as detached if it's in the process of mounting.
-        if !rc.desiredStateOfWorld.VolumeExists(attachedVolume.VolumeName) &&
-            !rc.operationExecutor.IsOperationPending(attachedVolume.VolumeName, nestedpendingoperations.EmptyUniquePodName, nestedpendingoperations.EmptyNodeName) {
-            if attachedVolume.DeviceMayBeMounted() {
-                // Volume is globally mounted to device, unmount it
-                klog.V(5).Infof(attachedVolume.GenerateMsgDetailed("Starting operationExecutor.UnmountDevice", ""))
-                err := rc.operationExecutor.UnmountDevice(
-                    attachedVolume.AttachedVolume, rc.actualStateOfWorld, rc.hostutil)
-                if err != nil &&
-                    !nestedpendingoperations.IsAlreadyExists(err) &&
-                    !exponentialbackoff.IsExponentialBackoff(err) {
-                    // Ignore nestedpendingoperations.IsAlreadyExists and exponentialbackoff.IsExponentialBackoff errors, they are expected.
-                    // Log all other errors.
-                    klog.Errorf(attachedVolume.GenerateErrorDetailed(fmt.Sprintf("operationExecutor.UnmountDevice failed (controllerAttachDetachEnabled %v)", rc.controllerAttachDetachEnabled), err).Error())
-                }
-                if err == nil {
-                    klog.Infof(attachedVolume.GenerateMsgDetailed("operationExecutor.UnmountDevice started", ""))
-                }
-            } else {
-                // Volume is attached to node, detach it
-                // Kubelet not responsible for detaching or this volume has a non-attachable volume plugin.
-                if rc.controllerAttachDetachEnabled || !attachedVolume.PluginIsAttachable {
-                    rc.actualStateOfWorld.MarkVolumeAsDetached(attachedVolume.VolumeName, attachedVolume.NodeName)
-                    klog.Infof(attachedVolume.GenerateMsgDetailed("Volume detached", fmt.Sprintf("DevicePath %q", attachedVolume.DevicePath)))
-                } else {
-                    // Only detach if kubelet detach is enabled
-                    klog.V(5).Infof(attachedVolume.GenerateMsgDetailed("Starting operationExecutor.DetachVolume", ""))
-                    err := rc.operationExecutor.DetachVolume(
-                        attachedVolume.AttachedVolume, false /* verifySafeToDetach */, rc.actualStateOfWorld)
-                    if err != nil &&
-                        !nestedpendingoperations.IsAlreadyExists(err) &&
-                        !exponentialbackoff.IsExponentialBackoff(err) {
-                        // Ignore nestedpendingoperations.IsAlreadyExists && exponentialbackoff.IsExponentialBackoff errors, they are expected.
-                        // Log all other errors.
-                        klog.Errorf(attachedVolume.GenerateErrorDetailed(fmt.Sprintf("operationExecutor.DetachVolume failed (controllerAttachDetachEnabled %v)", rc.controllerAttachDetachEnabled), err).Error())
-                    }
-                    if err == nil {
-                        klog.Infof(attachedVolume.GenerateMsgDetailed("operationExecutor.DetachVolume started", ""))
-                    }
-                }
-            }
-        }
-    }
+func (oe *operationExecutor) MountVolume(
+	waitForAttachTimeout time.Duration,
+	volumeToMount VolumeToMount,
+	actualStateOfWorld ActualStateOfWorldMounterUpdater,
+	isRemount bool) error {
+	fsVolume, err := util.CheckVolumeModeFilesystem(volumeToMount.VolumeSpec)
+	if err != nil {
+		return err
+	}
+	var generatedOperations volumetypes.GeneratedOperations
+	if fsVolume {
+		// Filesystem volume case
+		// Mount/remount a volume when a volume is attached
+		generatedOperations = oe.operationGenerator.GenerateMountVolumeFunc(
+			waitForAttachTimeout, volumeToMount, actualStateOfWorld, isRemount)
+
+	} else {
+		// Block volume case
+		// Creates a map to device if a volume is attached
+		generatedOperations, err = oe.operationGenerator.GenerateMapVolumeFunc(
+			waitForAttachTimeout, volumeToMount, actualStateOfWorld)
+	}
+	if err != nil {
+		return err
+	}
+	// Avoid executing mount/map from multiple pods referencing the
+	// same volume in parallel
+	podName := nestedpendingoperations.EmptyUniquePodName
+
+	// TODO: remove this -- not necessary
+	if !volumeToMount.PluginIsAttachable && !volumeToMount.PluginIsDeviceMountable {
+		// volume plugins which are Non-attachable and Non-deviceMountable can execute mount for multiple pods
+		// referencing the same volume in parallel
+		podName = util.GetUniquePodName(volumeToMount.Pod)
+	}
+
+	// TODO mount_device
+	return oe.pendingOperations.Run(
+		volumeToMount.VolumeName, podName, "" /* nodeName */, generatedOperations)
 }
 
-// sync process tries to observe the real world by scanning all pods' volume directories from the disk.
-// If the actual and desired state of worlds are not consistent with the observed world, it means that some
-// mounted volumes are left out probably during kubelet restart. This process will reconstruct
-// the volumes and update the actual and desired states. For the volumes that cannot support reconstruction,
-// it will try to clean up the mount paths with operation executor.
-func (rc *reconciler) sync() {
-    defer rc.updateLastSyncTime()
-    rc.syncStates()
-}
+
+
 
 ```
 
