@@ -412,7 +412,7 @@ func NewOperationExecutor(
 }
 
 ```
-plugin manager源码:
+NewpluginManager源码:
 ```go
 // in kubernetes/pkg/kubelet/pluginmanager/plugin_manager.go
 func NewPluginManager(
@@ -1112,20 +1112,20 @@ func (rc *reconciler) reconciliationLoopFunc() func() {
 }
 
 func (rc *reconciler) reconcile() {
-    // Unmounts are triggered before mounts so that a volume that was
-    // referenced by a pod that was deleted and is now referenced by another
-    // pod is unmounted from the first pod before being mounted to the new
-    // pod.
-    rc.unmountVolumes()
+	// Unmounts are triggered before mounts so that a volume that was
+	// referenced by a pod that was deleted and is now referenced by another
+	// pod is unmounted from the first pod before being mounted to the new
+	// pod.
+	rc.unmountVolumes()
 
-    // Next we mount required volumes. This function could also trigger
-    // attach if kubelet is responsible for attaching volumes.
-    // If underlying PVC was resized while in-use then this function also handles volume
-    // resizing.
-    rc.mountAttachVolumes()
+	// Next we mount required volumes. This function could also trigger
+	// attach if kubelet is responsible for attaching volumes.
+	// If underlying PVC was resized while in-use then this function also handles volume
+	// resizing.
+	rc.mountOrAttachVolumes()
 
-    // Ensure devices that should be detached/unmounted are detached/unmounted.
-    rc.unmountDetachDevices()
+	// Ensure devices that should be detached/unmounted are detached/unmounted.
+	rc.unmountDetachDevices()
 }
 
 func (rc *reconciler) unmountVolumes() {
@@ -1152,98 +1152,48 @@ func (rc *reconciler) unmountVolumes() {
     }
 }
 
-func (rc *reconciler) mountAttachVolumes() {
-    // Ensure volumes that should be attached/mounted are attached/mounted.
-    for _, volumeToMount := range rc.desiredStateOfWorld.GetVolumesToMount() {
-        volMounted, devicePath, err := rc.actualStateOfWorld.PodExistsInVolume(volumeToMount.PodName, volumeToMount.VolumeName)
-        volumeToMount.DevicePath = devicePath
-        if cache.IsVolumeNotAttachedError(err) {
-            if rc.controllerAttachDetachEnabled || !volumeToMount.PluginIsAttachable {
-                // Volume is not attached (or doesn't implement attacher), kubelet attach is disabled, wait
-                // for controller to finish attaching volume.
-                klog.V(5).Infof(volumeToMount.GenerateMsgDetailed("Starting operationExecutor.VerifyControllerAttachedVolume", ""))
-                err := rc.operationExecutor.VerifyControllerAttachedVolume(
-                    volumeToMount.VolumeToMount,
-                    rc.nodeName,
-                    rc.actualStateOfWorld)
-                if err != nil &&
-                    !nestedpendingoperations.IsAlreadyExists(err) &&
-                    !exponentialbackoff.IsExponentialBackoff(err) {
-                    // Ignore nestedpendingoperations.IsAlreadyExists and exponentialbackoff.IsExponentialBackoff errors, they are expected.
-                    // Log all other errors.
-                    klog.Errorf(volumeToMount.GenerateErrorDetailed(fmt.Sprintf("operationExecutor.VerifyControllerAttachedVolume failed (controllerAttachDetachEnabled %v)", rc.controllerAttachDetachEnabled), err).Error())
-                }
-                if err == nil {
-                    klog.Infof(volumeToMount.GenerateMsgDetailed("operationExecutor.VerifyControllerAttachedVolume started", ""))
-                }
-            } else {
-                // Volume is not attached to node, kubelet attach is enabled, volume implements an attacher,
-                // so attach it
-                volumeToAttach := operationexecutor.VolumeToAttach{
-                    VolumeName: volumeToMount.VolumeName,
-                    VolumeSpec: volumeToMount.VolumeSpec,
-                    NodeName:   rc.nodeName,
-                }
-                klog.V(5).Infof(volumeToAttach.GenerateMsgDetailed("Starting operationExecutor.AttachVolume", ""))
-                err := rc.operationExecutor.AttachVolume(volumeToAttach, rc.actualStateOfWorld)
-                if err != nil &&
-                    !nestedpendingoperations.IsAlreadyExists(err) &&
-                    !exponentialbackoff.IsExponentialBackoff(err) {
-                    // Ignore nestedpendingoperations.IsAlreadyExists and exponentialbackoff.IsExponentialBackoff errors, they are expected.
-                    // Log all other errors.
-                    klog.Errorf(volumeToMount.GenerateErrorDetailed(fmt.Sprintf("operationExecutor.AttachVolume failed (controllerAttachDetachEnabled %v)", rc.controllerAttachDetachEnabled), err).Error())
-                }
-                if err == nil {
-                    klog.Infof(volumeToMount.GenerateMsgDetailed("operationExecutor.AttachVolume started", ""))
-                }
-            }
-        } else if !volMounted || cache.IsRemountRequiredError(err) {
-            // Volume is not mounted, or is already mounted, but requires remounting
-            remountingLogStr := ""
-            isRemount := cache.IsRemountRequiredError(err)
-            if isRemount {
-                remountingLogStr = "Volume is already mounted to pod, but remount was requested."
-            }
-            klog.V(4).Infof(volumeToMount.GenerateMsgDetailed("Starting operationExecutor.MountVolume", remountingLogStr))
-            //最重要的mount执行
-            err := rc.operationExecutor.MountVolume(
-                rc.waitForAttachTimeout,
-                volumeToMount.VolumeToMount,
-                rc.actualStateOfWorld,
-                isRemount)
-            if err != nil &&
-                !nestedpendingoperations.IsAlreadyExists(err) &&
-                !exponentialbackoff.IsExponentialBackoff(err) {
-                // Ignore nestedpendingoperations.IsAlreadyExists and exponentialbackoff.IsExponentialBackoff errors, they are expected.
-                // Log all other errors.
-                klog.Errorf(volumeToMount.GenerateErrorDetailed(fmt.Sprintf("operationExecutor.MountVolume failed (controllerAttachDetachEnabled %v)", rc.controllerAttachDetachEnabled), err).Error())
-            }
-            if err == nil {
-                if remountingLogStr == "" {
-                    klog.V(1).Infof(volumeToMount.GenerateMsgDetailed("operationExecutor.MountVolume started", remountingLogStr))
-                } else {
-                    klog.V(5).Infof(volumeToMount.GenerateMsgDetailed("operationExecutor.MountVolume started", remountingLogStr))
-                }
-            }
-        } else if cache.IsFSResizeRequiredError(err) &&
-            utilfeature.DefaultFeatureGate.Enabled(features.ExpandInUsePersistentVolumes) {
-            klog.V(4).Infof(volumeToMount.GenerateMsgDetailed("Starting operationExecutor.ExpandInUseVolume", ""))
-            err := rc.operationExecutor.ExpandInUseVolume(
-                volumeToMount.VolumeToMount,
-                rc.actualStateOfWorld)
-            if err != nil &&
-                !nestedpendingoperations.IsAlreadyExists(err) &&
-                !exponentialbackoff.IsExponentialBackoff(err) {
-                // Ignore nestedpendingoperations.IsAlreadyExists and exponentialbackoff.IsExponentialBackoff errors, they are expected.
-                // Log all other errors.
-                klog.Errorf(volumeToMount.GenerateErrorDetailed("operationExecutor.ExpandInUseVolume failed", err).Error())
-            }
-            if err == nil {
-                klog.V(4).Infof(volumeToMount.GenerateMsgDetailed("operationExecutor.ExpandInUseVolume started", ""))
-            }
-        }
-    }
+func (rc *reconciler) mountOrAttachVolumes() {
+	// Ensure volumes that should be attached/mounted are attached/mounted.
+	for _, volumeToMount := range rc.desiredStateOfWorld.GetVolumesToMount() {
+		volMounted, devicePath, err := rc.actualStateOfWorld.PodExistsInVolume(volumeToMount.PodName, volumeToMount.VolumeName, volumeToMount.PersistentVolumeSize)
+		volumeToMount.DevicePath = devicePath
+		if cache.IsVolumeNotAttachedError(err) {
+			rc.waitForVolumeAttach(volumeToMount)
+		} else if !volMounted || cache.IsRemountRequiredError(err) {
+			rc.mountAttachedVolumes(volumeToMount, err)
+		} else if cache.IsFSResizeRequiredError(err) {
+			fsResizeRequiredErr, _ := err.(cache.FsResizeRequiredError)
+			rc.expandVolume(volumeToMount, fsResizeRequiredErr.CurrentSize)
+		}
+	}
 }
+
+func (rc *reconciler) mountAttachedVolumes(volumeToMount cache.VolumeToMount, podExistError error) {
+	// Volume is not mounted, or is already mounted, but requires remounting
+	remountingLogStr := ""
+	isRemount := cache.IsRemountRequiredError(podExistError)
+	if isRemount {
+		remountingLogStr = "Volume is already mounted to pod, but remount was requested."
+	}
+	klog.V(4).InfoS(volumeToMount.GenerateMsgDetailed("Starting operationExecutor.MountVolume", remountingLogStr), "pod", klog.KObj(volumeToMount.Pod))
+	err := rc.operationExecutor.MountVolume(
+		rc.waitForAttachTimeout,
+		volumeToMount.VolumeToMount,
+		rc.actualStateOfWorld,
+		isRemount)
+	if err != nil && !isExpectedError(err) {
+		klog.ErrorS(err, volumeToMount.GenerateErrorDetailed(fmt.Sprintf("operationExecutor.MountVolume failed (controllerAttachDetachEnabled %v)", rc.controllerAttachDetachEnabled), err).Error(), "pod", klog.KObj(volumeToMount.Pod))
+	}
+	if err == nil {
+		if remountingLogStr == "" {
+			klog.V(1).InfoS(volumeToMount.GenerateMsgDetailed("operationExecutor.MountVolume started", remountingLogStr), "pod", klog.KObj(volumeToMount.Pod))
+		} else {
+			klog.V(5).InfoS(volumeToMount.GenerateMsgDetailed("operationExecutor.MountVolume started", remountingLogStr), "pod", klog.KObj(volumeToMount.Pod))
+		}
+	}
+}
+
+
 
 func (oe *operationExecutor) MountVolume(
 	waitForAttachTimeout time.Duration,
@@ -1287,9 +1237,719 @@ func (oe *operationExecutor) MountVolume(
 }
 
 
+func (og *operationGenerator) GenerateMountVolumeFunc(
+	waitForAttachTimeout time.Duration,
+	volumeToMount VolumeToMount,
+	actualStateOfWorld ActualStateOfWorldMounterUpdater,
+	isRemount bool) volumetypes.GeneratedOperations {
 
+	volumePluginName := unknownVolumePlugin
+	volumePlugin, err :=
+		og.volumePluginMgr.FindPluginBySpec(volumeToMount.VolumeSpec)
+	if err == nil && volumePlugin != nil {
+		volumePluginName = volumePlugin.GetPluginName()
+	}
+
+	mountVolumeFunc := func() volumetypes.OperationContext {
+		//遍历所有plugin判断volumeSpec符合哪种plugin
+        // Get mounter plugin
+		volumePlugin, err := og.volumePluginMgr.FindPluginBySpec(volumeToMount.VolumeSpec)
+
+		migrated := getMigratedStatusBySpec(volumeToMount.VolumeSpec)
+
+		if err != nil || volumePlugin == nil {
+			eventErr, detailedErr := volumeToMount.GenerateError("MountVolume.FindPluginBySpec failed", err)
+			return volumetypes.NewOperationContext(eventErr, detailedErr, migrated)
+		}
+
+		affinityErr := checkNodeAffinity(og, volumeToMount)
+		if affinityErr != nil {
+			eventErr, detailedErr := volumeToMount.GenerateError("MountVolume.NodeAffinity check failed", affinityErr)
+			return volumetypes.NewOperationContext(eventErr, detailedErr, migrated)
+		}
+        //重要点
+		volumeMounter, newMounterErr := volumePlugin.NewMounter(
+			volumeToMount.VolumeSpec,
+			volumeToMount.Pod,
+			volume.VolumeOptions{})
+		if newMounterErr != nil {
+			eventErr, detailedErr := volumeToMount.GenerateError("MountVolume.NewMounter initialization failed", newMounterErr)
+			return volumetypes.NewOperationContext(eventErr, detailedErr, migrated)
+		}
+
+		mountCheckError := checkMountOptionSupport(og, volumeToMount, volumePlugin)
+		if mountCheckError != nil {
+			eventErr, detailedErr := volumeToMount.GenerateError("MountVolume.MountOptionSupport check failed", mountCheckError)
+			return volumetypes.NewOperationContext(eventErr, detailedErr, migrated)
+		}
+
+		// Enforce ReadWriteOncePod access mode if it is the only one present. This is also enforced during scheduling.
+		if utilfeature.DefaultFeatureGate.Enabled(features.ReadWriteOncePod) &&
+			actualStateOfWorld.IsVolumeMountedElsewhere(volumeToMount.VolumeName, volumeToMount.PodName) &&
+			// Because we do not know what access mode the pod intends to use if there are multiple.
+			len(volumeToMount.VolumeSpec.PersistentVolume.Spec.AccessModes) == 1 &&
+			v1helper.ContainsAccessMode(volumeToMount.VolumeSpec.PersistentVolume.Spec.AccessModes, v1.ReadWriteOncePod) {
+
+			err = goerrors.New("volume uses the ReadWriteOncePod access mode and is already in use by another pod")
+			eventErr, detailedErr := volumeToMount.GenerateError("MountVolume.SetUp failed", err)
+			return volumetypes.NewOperationContext(eventErr, detailedErr, migrated)
+		}
+
+		// Get attacher, if possible
+		attachableVolumePlugin, _ :=
+			og.volumePluginMgr.FindAttachablePluginBySpec(volumeToMount.VolumeSpec)
+		var volumeAttacher volume.Attacher
+		if attachableVolumePlugin != nil {
+			volumeAttacher, _ = attachableVolumePlugin.NewAttacher()
+		}
+
+		// get deviceMounter, if possible
+		deviceMountableVolumePlugin, _ := og.volumePluginMgr.FindDeviceMountablePluginBySpec(volumeToMount.VolumeSpec)
+		var volumeDeviceMounter volume.DeviceMounter
+		if deviceMountableVolumePlugin != nil {
+			volumeDeviceMounter, _ = deviceMountableVolumePlugin.NewDeviceMounter()
+		}
+
+		var fsGroup *int64
+		var fsGroupChangePolicy *v1.PodFSGroupChangePolicy
+		if podSc := volumeToMount.Pod.Spec.SecurityContext; podSc != nil {
+			if podSc.FSGroup != nil {
+				fsGroup = podSc.FSGroup
+			}
+			if podSc.FSGroupChangePolicy != nil {
+				fsGroupChangePolicy = podSc.FSGroupChangePolicy
+			}
+		}
+
+		devicePath := volumeToMount.DevicePath
+		if volumeAttacher != nil {
+			// Wait for attachable volumes to finish attaching
+			klog.InfoS(volumeToMount.GenerateMsgDetailed("MountVolume.WaitForAttach entering", fmt.Sprintf("DevicePath %q", volumeToMount.DevicePath)), "pod", klog.KObj(volumeToMount.Pod))
+
+			devicePath, err = volumeAttacher.WaitForAttach(
+				volumeToMount.VolumeSpec, devicePath, volumeToMount.Pod, waitForAttachTimeout)
+			if err != nil {
+				// On failure, return error. Caller will log and retry.
+				eventErr, detailedErr := volumeToMount.GenerateError("MountVolume.WaitForAttach failed", err)
+				return volumetypes.NewOperationContext(eventErr, detailedErr, migrated)
+			}
+
+			klog.InfoS(volumeToMount.GenerateMsgDetailed("MountVolume.WaitForAttach succeeded", fmt.Sprintf("DevicePath %q", devicePath)), "pod", klog.KObj(volumeToMount.Pod))
+		}
+
+		var resizeError error
+		resizeOptions := volume.NodeResizeOptions{
+			DevicePath: devicePath,
+		}
+
+		if volumeDeviceMounter != nil && actualStateOfWorld.GetDeviceMountState(volumeToMount.VolumeName) != DeviceGloballyMounted {
+			deviceMountPath, err :=
+				volumeDeviceMounter.GetDeviceMountPath(volumeToMount.VolumeSpec)
+			if err != nil {
+				// On failure, return error. Caller will log and retry.
+				eventErr, detailedErr := volumeToMount.GenerateError("MountVolume.GetDeviceMountPath failed", err)
+				return volumetypes.NewOperationContext(eventErr, detailedErr, migrated)
+			}
+
+			// Mount device to global mount path
+			err = volumeDeviceMounter.MountDevice(
+				volumeToMount.VolumeSpec,
+				devicePath,
+				deviceMountPath,
+				volume.DeviceMounterArgs{FsGroup: fsGroup},
+			)
+			if err != nil {
+				og.checkForFailedMount(volumeToMount, err)
+				og.markDeviceErrorState(volumeToMount, devicePath, deviceMountPath, err, actualStateOfWorld)
+				// On failure, return error. Caller will log and retry.
+				eventErr, detailedErr := volumeToMount.GenerateError("MountVolume.MountDevice failed", err)
+				return volumetypes.NewOperationContext(eventErr, detailedErr, migrated)
+			}
+
+			klog.InfoS(volumeToMount.GenerateMsgDetailed("MountVolume.MountDevice succeeded", fmt.Sprintf("device mount path %q", deviceMountPath)), "pod", klog.KObj(volumeToMount.Pod))
+
+			// Update actual state of world to reflect volume is globally mounted
+			markDeviceMountedErr := actualStateOfWorld.MarkDeviceAsMounted(
+				volumeToMount.VolumeName, devicePath, deviceMountPath)
+			if markDeviceMountedErr != nil {
+				// On failure, return error. Caller will log and retry.
+				eventErr, detailedErr := volumeToMount.GenerateError("MountVolume.MarkDeviceAsMounted failed", markDeviceMountedErr)
+				return volumetypes.NewOperationContext(eventErr, detailedErr, migrated)
+			}
+			// set staging path for volume expansion
+			resizeOptions.DeviceStagePath = deviceMountPath
+		}
+
+		// Execute mount
+        // 执行mount操作
+		mountErr := volumeMounter.SetUp(volume.MounterArgs{
+			FsUser:              util.FsUserFrom(volumeToMount.Pod),
+			FsGroup:             fsGroup,
+			DesiredSize:         volumeToMount.DesiredSizeLimit,
+			FSGroupChangePolicy: fsGroupChangePolicy,
+		})
+		// Update actual state of world
+		markOpts := MarkVolumeOpts{
+			PodName:             volumeToMount.PodName,
+			PodUID:              volumeToMount.Pod.UID,
+			VolumeName:          volumeToMount.VolumeName,
+			Mounter:             volumeMounter,
+			OuterVolumeSpecName: volumeToMount.OuterVolumeSpecName,
+			VolumeGidVolume:     volumeToMount.VolumeGidValue,
+			VolumeSpec:          volumeToMount.VolumeSpec,
+			VolumeMountState:    VolumeMounted,
+		}
+		if mountErr != nil {
+			og.checkForFailedMount(volumeToMount, mountErr)
+			og.markVolumeErrorState(volumeToMount, markOpts, mountErr, actualStateOfWorld)
+			// On failure, return error. Caller will log and retry.
+			eventErr, detailedErr := volumeToMount.GenerateError("MountVolume.SetUp failed", mountErr)
+			return volumetypes.NewOperationContext(eventErr, detailedErr, migrated)
+		}
+
+		detailedMsg := volumeToMount.GenerateMsgDetailed("MountVolume.SetUp succeeded", "")
+		verbosity := klog.Level(1)
+		if isRemount {
+			verbosity = klog.Level(4)
+		}
+		klog.V(verbosity).InfoS(detailedMsg, "pod", klog.KObj(volumeToMount.Pod))
+		resizeOptions.DeviceMountPath = volumeMounter.GetPath()
+
+		_, resizeError = og.expandVolumeDuringMount(volumeToMount, actualStateOfWorld, resizeOptions)
+		if resizeError != nil {
+			klog.Errorf("MountVolume.NodeExpandVolume failed with %v", resizeError)
+			eventErr, detailedErr := volumeToMount.GenerateError("MountVolume.Setup failed while expanding volume", resizeError)
+			// At this point, MountVolume.Setup already succeeded, we should add volume into actual state
+			// so that reconciler can clean up volume when needed. However, volume resize failed,
+			// we should not mark the volume as mounted to avoid pod starts using it.
+			// Considering the above situations, we mark volume as uncertain here so that reconciler will tigger
+			// volume tear down when pod is deleted, and also makes sure pod will not start using it.
+			if err := actualStateOfWorld.MarkVolumeMountAsUncertain(markOpts); err != nil {
+				klog.Errorf(volumeToMount.GenerateErrorDetailed("MountVolume.MarkVolumeMountAsUncertain failed", err).Error())
+			}
+			return volumetypes.NewOperationContext(eventErr, detailedErr, migrated)
+		}
+
+		// record total time it takes to mount a volume. This is end to end time that includes waiting for volume to attach, node to be update
+		// plugin call to succeed
+		mountRequestTime := volumeToMount.MountRequestTime
+		totalTimeTaken := time.Since(mountRequestTime).Seconds()
+		util.RecordOperationLatencyMetric(util.GetFullQualifiedPluginNameForVolume(volumePluginName, volumeToMount.VolumeSpec), "overall_volume_mount", totalTimeTaken)
+
+		markVolMountedErr := actualStateOfWorld.MarkVolumeAsMounted(markOpts)
+		if markVolMountedErr != nil {
+			// On failure, return error. Caller will log and retry.
+			eventErr, detailedErr := volumeToMount.GenerateError("MountVolume.MarkVolumeAsMounted failed", markVolMountedErr)
+			return volumetypes.NewOperationContext(eventErr, detailedErr, migrated)
+		}
+		return volumetypes.NewOperationContext(nil, nil, migrated)
+	}
+
+	eventRecorderFunc := func(err *error) {
+		if *err != nil {
+			og.recorder.Eventf(volumeToMount.Pod, v1.EventTypeWarning, kevents.FailedMountVolume, (*err).Error())
+		}
+	}
+
+	return volumetypes.GeneratedOperations{
+		OperationName:     "volume_mount",
+		OperationFunc:     mountVolumeFunc,
+		EventRecorderFunc: eventRecorderFunc,
+		CompleteFunc:      util.OperationCompleteHook(util.GetFullQualifiedPluginNameForVolume(volumePluginName, volumeToMount.VolumeSpec), "volume_mount"),
+	}
+}
+
+
+func (plugin *nfsPlugin) NewMounter(spec *volume.Spec, pod *v1.Pod, _ volume.VolumeOptions) (volume.Mounter, error) {
+	return plugin.newMounterInternal(spec, pod, plugin.host.GetMounter(plugin.GetPluginName()))
+}
+
+func (plugin *nfsPlugin) newMounterInternal(spec *volume.Spec, pod *v1.Pod, mounter mount.Interface) (volume.Mounter, error) {
+	source, readOnly, err := getVolumeSource(spec)
+	if err != nil {
+		return nil, err
+	}
+	return &nfsMounter{
+		nfs: &nfs{
+			volName:         spec.Name(),
+			mounter:         mounter,
+			pod:             pod,
+			plugin:          plugin,
+			MetricsProvider: volume.NewMetricsStatFS(getPath(pod.UID, spec.Name(), plugin.host)),
+		},
+		server:       getServerFromSource(source),
+		exportPath:   source.Path,
+		readOnly:     readOnly,
+		mountOptions: util.MountOptionFromSpec(spec),
+	}, nil
+}
 
 ```
+```go
+// SetUp attaches the disk and bind mounts to the volume path.
+func (nfsMounter *nfsMounter) SetUp(mounterArgs volume.MounterArgs) error {
+	return nfsMounter.SetUpAt(nfsMounter.GetPath(), mounterArgs)
+}
+
+func (nfsMounter *nfsMounter) SetUpAt(dir string, mounterArgs volume.MounterArgs) error {
+	notMnt, err := mount.IsNotMountPoint(nfsMounter.mounter, dir)
+	klog.V(4).Infof("NFS mount set up: %s %v %v", dir, !notMnt, err)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if !notMnt {
+		return nil
+	}
+	if err := os.MkdirAll(dir, 0750); err != nil {
+		return err
+	}
+	source := fmt.Sprintf("%s:%s", nfsMounter.server, nfsMounter.exportPath)
+	options := []string{}
+	if nfsMounter.readOnly {
+		options = append(options, "ro")
+	}
+	mountOptions := util.JoinMountOptions(nfsMounter.mountOptions, options)
+	err = nfsMounter.mounter.MountSensitiveWithoutSystemd(source, dir, "nfs", mountOptions, nil)
+	if err != nil {
+		notMnt, mntErr := mount.IsNotMountPoint(nfsMounter.mounter, dir)
+		if mntErr != nil {
+			klog.Errorf("IsNotMountPoint check failed: %v", mntErr)
+			return err
+		}
+		if !notMnt {
+			if mntErr = nfsMounter.mounter.Unmount(dir); mntErr != nil {
+				klog.Errorf("Failed to unmount: %v", mntErr)
+				return err
+			}
+			notMnt, mntErr := mount.IsNotMountPoint(nfsMounter.mounter, dir)
+			if mntErr != nil {
+				klog.Errorf("IsNotMountPoint check failed: %v", mntErr)
+				return err
+			}
+			if !notMnt {
+				// This is very odd, we don't expect it.  We'll try again next sync loop.
+				klog.Errorf("%s is still mounted, despite call to unmount().  Will try again next sync loop.", dir)
+				return err
+			}
+		}
+		os.Remove(dir)
+		return err
+	}
+	return nil
+}
+```
+
+```go
+// MountSensitiveWithoutSystemd is the same as MountSensitive() but disable using systemd mount.
+func (mounter *Mounter) MountSensitiveWithoutSystemd(source string, target string, fstype string, options []string, sensitiveOptions []string) error {
+	return mounter.MountSensitiveWithoutSystemdWithMountFlags(source, target, fstype, options, sensitiveOptions, nil /* mountFlags */)
+}
+
+// MountSensitiveWithoutSystemdWithMountFlags is the same as MountSensitiveWithoutSystemd with additional mount flags.
+func (mounter *Mounter) MountSensitiveWithoutSystemdWithMountFlags(source string, target string, fstype string, options []string, sensitiveOptions []string, mountFlags []string) error {
+	mounterPath := ""
+	bind, bindOpts, bindRemountOpts, bindRemountOptsSensitive := MakeBindOptsSensitive(options, sensitiveOptions)
+	if bind {
+		err := mounter.doMount(mounterPath, defaultMountCommand, source, target, fstype, bindOpts, bindRemountOptsSensitive, mountFlags, false)
+		if err != nil {
+			return err
+		}
+		return mounter.doMount(mounterPath, defaultMountCommand, source, target, fstype, bindRemountOpts, bindRemountOptsSensitive, mountFlags, false)
+	}
+	// The list of filesystems that require containerized mounter on GCI image cluster
+	fsTypesNeedMounter := map[string]struct{}{
+		"nfs":       {},
+		"glusterfs": {},
+		"ceph":      {},
+		"cifs":      {},
+	}
+	if _, ok := fsTypesNeedMounter[fstype]; ok {
+		mounterPath = mounter.mounterPath
+	}
+	return mounter.doMount(mounterPath, defaultMountCommand, source, target, fstype, options, sensitiveOptions, mountFlags, false)
+}
+
+func (mounter *Mounter) doMount(mounterPath string, mountCmd string, source string, target string, fstype string, options []string, sensitiveOptions []string, mountFlags []string, systemdMountRequired bool) error {
+	mountArgs, mountArgsLogStr := MakeMountArgsSensitiveWithMountFlags(source, target, fstype, options, sensitiveOptions, mountFlags)
+	if len(mounterPath) > 0 {
+		mountArgs = append([]string{mountCmd}, mountArgs...)
+		mountArgsLogStr = mountCmd + " " + mountArgsLogStr
+		mountCmd = mounterPath
+	}
+
+	if mounter.withSystemd && systemdMountRequired {
+		// Try to run mount via systemd-run --scope. This will escape the
+		// service where kubelet runs and any fuse daemons will be started in a
+		// specific scope. kubelet service than can be restarted without killing
+		// these fuse daemons.
+		//
+		// Complete command line (when mounterPath is not used):
+		// systemd-run --description=... --scope -- mount -t <type> <what> <where>
+		//
+		// Expected flow:
+		// * systemd-run creates a transient scope (=~ cgroup) and executes its
+		//   argument (/bin/mount) there.
+		// * mount does its job, forks a fuse daemon if necessary and finishes.
+		//   (systemd-run --scope finishes at this point, returning mount's exit
+		//   code and stdout/stderr - thats one of --scope benefits).
+		// * systemd keeps the fuse daemon running in the scope (i.e. in its own
+		//   cgroup) until the fuse daemon dies (another --scope benefit).
+		//   Kubelet service can be restarted and the fuse daemon survives.
+		// * When the fuse daemon dies (e.g. during unmount) systemd removes the
+		//   scope automatically.
+		//
+		// systemd-mount is not used because it's too new for older distros
+		// (CentOS 7, Debian Jessie).
+		mountCmd, mountArgs, mountArgsLogStr = AddSystemdScopeSensitive("systemd-run", target, mountCmd, mountArgs, mountArgsLogStr)
+		// } else {
+		// No systemd-run on the host (or we failed to check it), assume kubelet
+		// does not run as a systemd service.
+		// No code here, mountCmd and mountArgs are already populated.
+	}
+
+	// Logging with sensitive mount options removed.
+	klog.V(4).Infof("Mounting cmd (%s) with arguments (%s)", mountCmd, mountArgsLogStr)
+	command := exec.Command(mountCmd, mountArgs...)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		if err.Error() == errNoChildProcesses {
+			if command.ProcessState.Success() {
+				// We don't consider errNoChildProcesses an error if the process itself succeeded (see - k/k issue #103753).
+				return nil
+			}
+			// Rewrite err with the actual exit error of the process.
+			err = &exec.ExitError{ProcessState: command.ProcessState}
+		}
+		klog.Errorf("Mount failed: %v\nMounting command: %s\nMounting arguments: %s\nOutput: %s\n", err, mountCmd, mountArgsLogStr, string(output))
+		return fmt.Errorf("mount failed: %v\nMounting command: %s\nMounting arguments: %s\nOutput: %s",
+			err, mountCmd, mountArgsLogStr, string(output))
+	}
+	return err
+}
+
+func (c *Cmd) CombinedOutput() ([]byte, error) {
+	if c.Stdout != nil {
+		return nil, errors.New("exec: Stdout already set")
+	}
+	if c.Stderr != nil {
+		return nil, errors.New("exec: Stderr already set")
+	}
+	var b bytes.Buffer
+	c.Stdout = &b
+	c.Stderr = &b
+	err := c.Run()
+	return b.Bytes(), err
+}
+
+```
+
+
+NewPluginManager:
+
+```go
+//有点看不懂？？
+func (grm *nestedPendingOperations) Run(
+	volumeName v1.UniqueVolumeName,
+	podName volumetypes.UniquePodName,
+	nodeName types.NodeName,
+	generatedOperations volumetypes.GeneratedOperations) error {
+	grm.lock.Lock()
+	defer grm.lock.Unlock()
+
+	opKey := operationKey{volumeName, podName, nodeName}
+
+	opExists, previousOpIndex := grm.isOperationExists(opKey)
+	if opExists {
+		previousOp := grm.operations[previousOpIndex]
+		// Operation already exists
+		if previousOp.operationPending {
+			// Operation is pending
+			return NewAlreadyExistsError(opKey)
+		}
+
+		backOffErr := previousOp.expBackoff.SafeToRetry(fmt.Sprintf("%+v", opKey))
+		if backOffErr != nil {
+			if previousOp.operationName == generatedOperations.OperationName {
+				return backOffErr
+			}
+			// previous operation and new operation are different. reset op. name and exp. backoff
+			grm.operations[previousOpIndex].operationName = generatedOperations.OperationName
+			grm.operations[previousOpIndex].expBackoff = exponentialbackoff.ExponentialBackoff{}
+		}
+
+		// Update existing operation to mark as pending.
+		grm.operations[previousOpIndex].operationPending = true
+		grm.operations[previousOpIndex].key = opKey
+	} else {
+		// Create a new operation
+		grm.operations = append(grm.operations,
+			operation{
+				key:              opKey,
+				operationPending: true,
+				operationName:    generatedOperations.OperationName,
+				expBackoff:       exponentialbackoff.ExponentialBackoff{},
+			})
+	}
+
+	go func() (eventErr, detailedErr error) {
+		// Handle unhandled panics (very unlikely)
+		defer k8sRuntime.HandleCrash()
+		// Handle completion of and error, if any, from operationFunc()
+		defer grm.operationComplete(opKey, &detailedErr)
+		return generatedOperations.Run()
+	}()
+
+	return nil
+}
+
+
+//一些会涉及的结构体
+
+// VolumePluginMgr tracks registered plugins.
+type VolumePluginMgr struct {
+	mutex                     sync.RWMutex
+	plugins                   map[string]VolumePlugin
+	prober                    DynamicPluginProber
+	probedPlugins             map[string]VolumePlugin
+	loggedDeprecationWarnings sets.String
+	Host                      VolumeHost
+}
+
+// Spec is an internal representation of a volume.  All API volume types translate to Spec.
+type Spec struct {
+	Volume                          *v1.Volume
+	PersistentVolume                *v1.PersistentVolume
+	ReadOnly                        bool
+	InlineVolumeSpecForCSIMigration bool
+	Migrated                        bool
+}
+
+func (og *operationGenerator) GenerateMountVolumeFunc(
+	waitForAttachTimeout time.Duration,
+	volumeToMount VolumeToMount,
+	actualStateOfWorld ActualStateOfWorldMounterUpdater,
+	isRemount bool) volumetypes.GeneratedOperations {
+
+	volumePluginName := unknownVolumePlugin
+    //找到合适类型的volumePlugin
+	volumePlugin, err :=
+		og.volumePluginMgr.FindPluginBySpec(volumeToMount.VolumeSpec)
+	if err == nil && volumePlugin != nil {
+        //返回PluginName string
+		volumePluginName = volumePlugin.GetPluginName()
+	}
+
+	mountVolumeFunc := func() volumetypes.OperationContext {
+		// Get mounter plugin
+		volumePlugin, err := og.volumePluginMgr.FindPluginBySpec(volumeToMount.VolumeSpec)
+
+		migrated := getMigratedStatusBySpec(volumeToMount.VolumeSpec)
+
+		if err != nil || volumePlugin == nil {
+			eventErr, detailedErr := volumeToMount.GenerateError("MountVolume.FindPluginBySpec failed", err)
+			return volumetypes.NewOperationContext(eventErr, detailedErr, migrated)
+		}
+
+		affinityErr := checkNodeAffinity(og, volumeToMount)
+		if affinityErr != nil {
+			eventErr, detailedErr := volumeToMount.GenerateError("MountVolume.NodeAffinity check failed", affinityErr)
+			return volumetypes.NewOperationContext(eventErr, detailedErr, migrated)
+		}
+        // 重点
+		volumeMounter, newMounterErr := volumePlugin.NewMounter(
+			volumeToMount.VolumeSpec,
+			volumeToMount.Pod,
+			volume.VolumeOptions{})
+		if newMounterErr != nil {
+			eventErr, detailedErr := volumeToMount.GenerateError("MountVolume.NewMounter initialization failed", newMounterErr)
+			return volumetypes.NewOperationContext(eventErr, detailedErr, migrated)
+		}
+
+		mountCheckError := checkMountOptionSupport(og, volumeToMount, volumePlugin)
+		if mountCheckError != nil {
+			eventErr, detailedErr := volumeToMount.GenerateError("MountVolume.MountOptionSupport check failed", mountCheckError)
+			return volumetypes.NewOperationContext(eventErr, detailedErr, migrated)
+		}
+
+		// Enforce ReadWriteOncePod access mode if it is the only one present. This is also enforced during scheduling.
+		if utilfeature.DefaultFeatureGate.Enabled(features.ReadWriteOncePod) &&
+			actualStateOfWorld.IsVolumeMountedElsewhere(volumeToMount.VolumeName, volumeToMount.PodName) &&
+			// Because we do not know what access mode the pod intends to use if there are multiple.
+			len(volumeToMount.VolumeSpec.PersistentVolume.Spec.AccessModes) == 1 &&
+			v1helper.ContainsAccessMode(volumeToMount.VolumeSpec.PersistentVolume.Spec.AccessModes, v1.ReadWriteOncePod) {
+
+			err = goerrors.New("volume uses the ReadWriteOncePod access mode and is already in use by another pod")
+			eventErr, detailedErr := volumeToMount.GenerateError("MountVolume.SetUp failed", err)
+			return volumetypes.NewOperationContext(eventErr, detailedErr, migrated)
+		}
+
+		// Get attacher, if possible
+		attachableVolumePlugin, _ :=
+			og.volumePluginMgr.FindAttachablePluginBySpec(volumeToMount.VolumeSpec)
+		var volumeAttacher volume.Attacher
+		if attachableVolumePlugin != nil {
+			volumeAttacher, _ = attachableVolumePlugin.NewAttacher()
+		}
+
+		// get deviceMounter, if possible
+		deviceMountableVolumePlugin, _ := og.volumePluginMgr.FindDeviceMountablePluginBySpec(volumeToMount.VolumeSpec)
+		var volumeDeviceMounter volume.DeviceMounter
+		if deviceMountableVolumePlugin != nil {
+			volumeDeviceMounter, _ = deviceMountableVolumePlugin.NewDeviceMounter()
+		}
+
+		var fsGroup *int64
+		var fsGroupChangePolicy *v1.PodFSGroupChangePolicy
+		if podSc := volumeToMount.Pod.Spec.SecurityContext; podSc != nil {
+			if podSc.FSGroup != nil {
+				fsGroup = podSc.FSGroup
+			}
+			if podSc.FSGroupChangePolicy != nil {
+				fsGroupChangePolicy = podSc.FSGroupChangePolicy
+			}
+		}
+
+		devicePath := volumeToMount.DevicePath
+		if volumeAttacher != nil {
+			// Wait for attachable volumes to finish attaching
+			klog.InfoS(volumeToMount.GenerateMsgDetailed("MountVolume.WaitForAttach entering", fmt.Sprintf("DevicePath %q", volumeToMount.DevicePath)), "pod", klog.KObj(volumeToMount.Pod))
+
+			devicePath, err = volumeAttacher.WaitForAttach(
+				volumeToMount.VolumeSpec, devicePath, volumeToMount.Pod, waitForAttachTimeout)
+			if err != nil {
+				// On failure, return error. Caller will log and retry.
+				eventErr, detailedErr := volumeToMount.GenerateError("MountVolume.WaitForAttach failed", err)
+				return volumetypes.NewOperationContext(eventErr, detailedErr, migrated)
+			}
+
+			klog.InfoS(volumeToMount.GenerateMsgDetailed("MountVolume.WaitForAttach succeeded", fmt.Sprintf("DevicePath %q", devicePath)), "pod", klog.KObj(volumeToMount.Pod))
+		}
+
+		var resizeError error
+		resizeOptions := volume.NodeResizeOptions{
+			DevicePath: devicePath,
+		}
+
+		if volumeDeviceMounter != nil && actualStateOfWorld.GetDeviceMountState(volumeToMount.VolumeName) != DeviceGloballyMounted {
+			deviceMountPath, err :=
+				volumeDeviceMounter.GetDeviceMountPath(volumeToMount.VolumeSpec)
+			if err != nil {
+				// On failure, return error. Caller will log and retry.
+				eventErr, detailedErr := volumeToMount.GenerateError("MountVolume.GetDeviceMountPath failed", err)
+				return volumetypes.NewOperationContext(eventErr, detailedErr, migrated)
+			}
+
+			// Mount device to global mount path
+			err = volumeDeviceMounter.MountDevice(
+				volumeToMount.VolumeSpec,
+				devicePath,
+				deviceMountPath,
+				volume.DeviceMounterArgs{FsGroup: fsGroup},
+			)
+			if err != nil {
+				og.checkForFailedMount(volumeToMount, err)
+				og.markDeviceErrorState(volumeToMount, devicePath, deviceMountPath, err, actualStateOfWorld)
+				// On failure, return error. Caller will log and retry.
+				eventErr, detailedErr := volumeToMount.GenerateError("MountVolume.MountDevice failed", err)
+				return volumetypes.NewOperationContext(eventErr, detailedErr, migrated)
+			}
+
+			klog.InfoS(volumeToMount.GenerateMsgDetailed("MountVolume.MountDevice succeeded", fmt.Sprintf("device mount path %q", deviceMountPath)), "pod", klog.KObj(volumeToMount.Pod))
+
+			// Update actual state of world to reflect volume is globally mounted
+			markDeviceMountedErr := actualStateOfWorld.MarkDeviceAsMounted(
+				volumeToMount.VolumeName, devicePath, deviceMountPath)
+			if markDeviceMountedErr != nil {
+				// On failure, return error. Caller will log and retry.
+				eventErr, detailedErr := volumeToMount.GenerateError("MountVolume.MarkDeviceAsMounted failed", markDeviceMountedErr)
+				return volumetypes.NewOperationContext(eventErr, detailedErr, migrated)
+			}
+			// set staging path for volume expansion
+			resizeOptions.DeviceStagePath = deviceMountPath
+		}
+
+		// Execute mount
+		mountErr := volumeMounter.SetUp(volume.MounterArgs{
+			FsUser:              util.FsUserFrom(volumeToMount.Pod),
+			FsGroup:             fsGroup,
+			DesiredSize:         volumeToMount.DesiredSizeLimit,
+			FSGroupChangePolicy: fsGroupChangePolicy,
+		})
+		// Update actual state of world
+		markOpts := MarkVolumeOpts{
+			PodName:             volumeToMount.PodName,
+			PodUID:              volumeToMount.Pod.UID,
+			VolumeName:          volumeToMount.VolumeName,
+			Mounter:             volumeMounter,
+			OuterVolumeSpecName: volumeToMount.OuterVolumeSpecName,
+			VolumeGidVolume:     volumeToMount.VolumeGidValue,
+			VolumeSpec:          volumeToMount.VolumeSpec,
+			VolumeMountState:    VolumeMounted,
+		}
+		if mountErr != nil {
+			og.checkForFailedMount(volumeToMount, mountErr)
+			og.markVolumeErrorState(volumeToMount, markOpts, mountErr, actualStateOfWorld)
+			// On failure, return error. Caller will log and retry.
+			eventErr, detailedErr := volumeToMount.GenerateError("MountVolume.SetUp failed", mountErr)
+			return volumetypes.NewOperationContext(eventErr, detailedErr, migrated)
+		}
+
+		detailedMsg := volumeToMount.GenerateMsgDetailed("MountVolume.SetUp succeeded", "")
+		verbosity := klog.Level(1)
+		if isRemount {
+			verbosity = klog.Level(4)
+		}
+		klog.V(verbosity).InfoS(detailedMsg, "pod", klog.KObj(volumeToMount.Pod))
+		resizeOptions.DeviceMountPath = volumeMounter.GetPath()
+
+		_, resizeError = og.expandVolumeDuringMount(volumeToMount, actualStateOfWorld, resizeOptions)
+		if resizeError != nil {
+			klog.Errorf("MountVolume.NodeExpandVolume failed with %v", resizeError)
+			eventErr, detailedErr := volumeToMount.GenerateError("MountVolume.Setup failed while expanding volume", resizeError)
+			// At this point, MountVolume.Setup already succeeded, we should add volume into actual state
+			// so that reconciler can clean up volume when needed. However, volume resize failed,
+			// we should not mark the volume as mounted to avoid pod starts using it.
+			// Considering the above situations, we mark volume as uncertain here so that reconciler will tigger
+			// volume tear down when pod is deleted, and also makes sure pod will not start using it.
+			if err := actualStateOfWorld.MarkVolumeMountAsUncertain(markOpts); err != nil {
+				klog.Errorf(volumeToMount.GenerateErrorDetailed("MountVolume.MarkVolumeMountAsUncertain failed", err).Error())
+			}
+			return volumetypes.NewOperationContext(eventErr, detailedErr, migrated)
+		}
+
+		// record total time it takes to mount a volume. This is end to end time that includes waiting for volume to attach, node to be update
+		// plugin call to succeed
+		mountRequestTime := volumeToMount.MountRequestTime
+		totalTimeTaken := time.Since(mountRequestTime).Seconds()
+		util.RecordOperationLatencyMetric(util.GetFullQualifiedPluginNameForVolume(volumePluginName, volumeToMount.VolumeSpec), "overall_volume_mount", totalTimeTaken)
+
+		markVolMountedErr := actualStateOfWorld.MarkVolumeAsMounted(markOpts)
+		if markVolMountedErr != nil {
+			// On failure, return error. Caller will log and retry.
+			eventErr, detailedErr := volumeToMount.GenerateError("MountVolume.MarkVolumeAsMounted failed", markVolMountedErr)
+			return volumetypes.NewOperationContext(eventErr, detailedErr, migrated)
+		}
+		return volumetypes.NewOperationContext(nil, nil, migrated)
+	}
+
+	eventRecorderFunc := func(err *error) {
+		if *err != nil {
+			og.recorder.Eventf(volumeToMount.Pod, v1.EventTypeWarning, kevents.FailedMountVolume, (*err).Error())
+		}
+	}
+
+	return volumetypes.GeneratedOperations{
+		OperationName:     "volume_mount",
+		OperationFunc:     mountVolumeFunc,
+		EventRecorderFunc: eventRecorderFunc,
+		CompleteFunc:      util.OperationCompleteHook(util.GetFullQualifiedPluginNameForVolume(volumePluginName, volumeToMount.VolumeSpec), "volume_mount"),
+	}
+}
+
+```
+
+
+
 
 CleanupMountPoint -> doCleanupMountPoint
 具体volume卸载操作
